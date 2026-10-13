@@ -1,8 +1,8 @@
 """Minimal example plugin for the BadUSB IDE marketplace."""
 
-ADDON_NAME = "Marketplace-Beispiel"
-ADDON_VERSION = "1.0.0"
-ADDON_DESCRIPTION = "Zeigt eine kurze Statusmeldung an."
+PLUGIN_NAME = "Marketplace-Beispiel2"
+PLUGIN_VERSION = "1.0.0"
+PLUGIN_DESCRIPTION = "Zeigt eine kurze Statusmeldung an."
 
 
 def register(ide):
