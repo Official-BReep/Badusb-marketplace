@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
 )
 
 ADDON_NAME = "Flipper Zero Bluetooth LE"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 ADDON_DESCRIPTION = (
     "BLE-UART-Transport für kompatible Flipper-Firmware; nutzt die vorhandenen "
     "seriellen CLI-, Datei- und Payload-Funktionen, sofern die Firmware CLI über BLE bridged."
@@ -195,6 +195,36 @@ def _run_async_in_worker(coro_factory, timeout=30):
     return result["value"]
 
 
+
+async def _discover_ble_devices(BleakScanner, timeout):
+    """Collect advertisements over the full scan window, merging later scan responses.
+
+    On Windows the first advertisement can have no local_name; a later scan-response
+    packet may contain it. Keep the most useful name and advertisement data per address.
+    """
+    found = {}
+
+    def on_detect(device, adv):
+        address = str(getattr(device, "address", ""))
+        if not address:
+            return
+        previous = found.get(address, {})
+        adv_name = getattr(adv, "local_name", None)
+        device_name = getattr(device, "name", None)
+        uuids = list(getattr(adv, "service_uuids", None) or [])
+        found[address] = {
+            "device": device,
+            "name": adv_name or device_name or previous.get("name"),
+            "uuids": uuids or previous.get("uuids", []),
+            "rssi": getattr(adv, "rssi", previous.get("rssi")),
+            "adv": adv,
+        }
+
+    async with BleakScanner(detection_callback=on_detect, scanning_mode="active"):
+        await asyncio.sleep(timeout)
+
+    return list(found.values())
+
 def _scan_dialog(ide, devices):
     dlg = QDialog(ide)
     dlg.setWindowTitle("Flipper Zero über Bluetooth LE auswählen")
@@ -205,9 +235,14 @@ def _scan_dialog(ide, devices):
         "garantiert nicht, dass dessen Firmware die CLI über Bluetooth bereitstellt."
     ))
     listing = QListWidget(dlg)
-    for device, adv_name in devices:
-        name = adv_name or device.name or "Unbekanntes BLE-Gerät"
-        listing.addItem(f"{name}    [{device.address}]")
+    for device, adv_name, uuids, rssi in devices:
+        name = adv_name or getattr(device, "name", None) or "Unbekanntes BLE-Gerät"
+        details = f"{name}    [{device.address}]"
+        if rssi is not None:
+            details += f"    {rssi} dBm"
+        if uuids:
+            details += "    · Dienste: " + ", ".join(str(x) for x in uuids[:3])
+        listing.addItem(details)
     if devices:
         listing.setCurrentRow(0)
     layout.addWidget(listing, 1)
@@ -250,22 +285,21 @@ def register(ide):
         try:
             # Bleak/WinRT must not run on the PyQt main thread, which may be STA.
             devices = _run_async_in_worker(
-                lambda: BleakScanner.discover(timeout=wait_s, return_adv=True),
+                lambda: _discover_ble_devices(BleakScanner, wait_s),
                 timeout=wait_s + 15,
             )
             rows = []
-            for _address, pair in devices.items():
-                device, adv = pair
-                adv_name = getattr(adv, "local_name", None)
-                name = adv_name or getattr(device, "name", None) or ""
-                # Show Flipper-like devices and devices advertising the UART service.
-                uuids = [str(x).lower() for x in (getattr(adv, "service_uuids", None) or [])]
-                if "flipper" in name.lower() or NUS_SERVICE_UUID in uuids or not name:
-                    rows.append((device, adv_name))
-            # If filtering yielded nothing, show all discovered devices rather than hiding them.
-            if not rows:
-                rows = [(pair[0], getattr(pair[1], "local_name", None)) for pair in devices.values()]
-            rows.sort(key=lambda item: ((item[1] or item[0].name or "").lower(), item[0].address))
+            for item in devices:
+                device = item["device"]
+                name = item.get("name") or getattr(device, "name", None)
+                uuids = [str(x).lower() for x in item.get("uuids", [])]
+                # Show every BLE device. Some Windows adapters expose the Flipper only
+                # by address until its scan response/name becomes available.
+                rows.append((device, name, uuids, item.get("rssi")))
+            rows.sort(key=lambda item: (
+                0 if "flipper" in (item[1] or "").lower() else 1,
+                (item[1] or "").lower(), item[0].address
+            ))
         except Exception as exc:
             QMessageBox.critical(ide, "BLE-Suche fehlgeschlagen", str(exc))
             return
@@ -276,7 +310,7 @@ def register(ide):
         selected = _scan_dialog(ide, rows)
         if selected is None:
             return
-        device, adv_name = selected
+        device, adv_name, _adv_uuids, _adv_rssi = selected
         loop = asyncio.new_event_loop()
         thread = threading.Thread(target=_ble_worker, args=(loop,), name="ScriptMonkey-BLE", daemon=True)
         thread.start()
