@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
 )
 
 ADDON_NAME = "Flipper Zero Bluetooth LE"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 ADDON_DESCRIPTION = (
     "BLE-UART-Transport für kompatible Flipper-Firmware; nutzt die vorhandenen "
     "seriellen CLI-, Datei- und Payload-Funktionen, sofern die Firmware CLI über BLE bridged."
@@ -151,6 +151,50 @@ def _ble_worker(loop):
     loop.close()
 
 
+def _run_async_in_worker(coro_factory, timeout=30):
+    """Run a one-shot Bleak operation on a fresh Windows MTA-capable thread.
+
+    Do not run Bleak's WinRT backend on the PyQt GUI thread: other imports may
+    have initialized that thread as STA without a compatible asyncio message pump.
+    """
+    result = {"value": None, "error": None}
+
+    def worker():
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            # If a dependency initialized this worker thread as STA, undo that
+            # initialization before the first Bleak WinRT call. On other systems
+            # and when COM is not initialized this is a harmless no-op.
+            try:
+                from bleak.backends.winrt.util import uninitialize_sta
+                uninitialize_sta()
+            except (ImportError, AttributeError, OSError):
+                pass
+            result["value"] = loop.run_until_complete(coro_factory())
+        except BaseException as exc:
+            result["error"] = exc
+        finally:
+            try:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
+            loop.close()
+
+    thread = threading.Thread(target=worker, name="ScriptMonkey-BLE-Worker", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise TimeoutError("Bluetooth-Operation hat das Zeitlimit überschritten.")
+    if result["error"] is not None:
+        raise result["error"]
+    return result["value"]
+
+
 def _scan_dialog(ide, devices):
     dlg = QDialog(ide)
     dlg.setWindowTitle("Flipper Zero über Bluetooth LE auswählen")
@@ -204,7 +248,11 @@ def register(ide):
         if not ok:
             return
         try:
-            devices = asyncio.run(BleakScanner.discover(timeout=wait_s, return_adv=True))
+            # Bleak/WinRT must not run on the PyQt main thread, which may be STA.
+            devices = _run_async_in_worker(
+                lambda: BleakScanner.discover(timeout=wait_s, return_adv=True),
+                timeout=wait_s + 15,
+            )
             rows = []
             for _address, pair in devices.items():
                 device, adv = pair
@@ -232,26 +280,39 @@ def register(ide):
         loop = asyncio.new_event_loop()
         thread = threading.Thread(target=_ble_worker, args=(loop,), name="ScriptMonkey-BLE", daemon=True)
         thread.start()
-        client = BleakClient(device)
         try:
             async def establish():
-                await client.connect()
-                services = await client.get_services()
-                chars = {str(ch.uuid).lower(): ch for service in services for ch in service.characteristics}
-                rx = chars.get(NUS_RX_UUID)
-                tx = chars.get(NUS_TX_UUID)
-                if rx is None or tx is None:
-                    await client.disconnect()
-                    raise RuntimeError(
-                        "Das Gerät stellt den erwarteten Nordic-UART-Dienst nicht bereit.\n\n"
-                        "Stock-Flipper-Firmware bietet normalerweise keinen BLE-zu-USB-CLI-Bridge-Dienst. "
-                        "Für die Wiederverwendung der vorhandenen Datei-/CLI-/Payload-Funktionen ist "
-                        "kompatible Firmware oder eine entsprechende BLE-UART-Bridge erforderlich."
-                    )
-                adapter = BleUartSerialAdapter(device, loop, thread, client, rx, tx)
-                await client.start_notify(tx, adapter._notify)
-                return adapter
-            adapter = asyncio.run_coroutine_threadsafe(establish(), loop).result(timeout=20)
+                # Construct BleakClient inside the thread/event loop that owns it.
+                try:
+                    from bleak.backends.winrt.util import uninitialize_sta
+                    uninitialize_sta()
+                except (ImportError, AttributeError, OSError):
+                    pass
+                client = BleakClient(device)
+                try:
+                    await client.connect()
+                    services = await client.get_services()
+                    chars = {str(ch.uuid).lower(): ch for service in services for ch in service.characteristics}
+                    rx = chars.get(NUS_RX_UUID)
+                    tx = chars.get(NUS_TX_UUID)
+                    if rx is None or tx is None:
+                        raise RuntimeError(
+                            "Das Gerät stellt den erwarteten Nordic-UART-Dienst nicht bereit.\n\n"
+                            "Stock-Flipper-Firmware bietet normalerweise keinen BLE-zu-USB-CLI-Bridge-Dienst. "
+                            "Für die Wiederverwendung der vorhandenen Datei-/CLI-/Payload-Funktionen ist "
+                            "kompatible Firmware oder eine entsprechende BLE-UART-Bridge erforderlich."
+                        )
+                    adapter = BleUartSerialAdapter(device, loop, thread, client, rx, tx)
+                    await client.start_notify(tx, adapter._notify)
+                    return adapter
+                except BaseException:
+                    if client.is_connected:
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                    raise
+            adapter = asyncio.run_coroutine_threadsafe(establish(), loop).result(timeout=30)
             state["adapter"] = adapter
             ide.serial_conn = adapter
             ide.serial_port = "BLE · " + (adv_name or device.name or device.address)
@@ -269,7 +330,7 @@ def register(ide):
         except Exception as exc:
             try:
                 loop.call_soon_threadsafe(loop.stop)
-                thread.join(timeout=2)
+                thread.join(timeout=3)
             except Exception:
                 pass
             QMessageBox.warning(ide, "BLE-Verbindung fehlgeschlagen", str(exc))
